@@ -8,6 +8,7 @@ import bloop.Project
 import bloop.cli.Commands
 import bloop.logging.{Logger, PublisherLogger}
 import bloop.exec.JavaEnv
+import bloop.io.AbsolutePath
 import bloop.io.Paths.delete
 import bloop.tasks.{CompilationHelpers, TestUtil}
 import bloop.tasks.TestUtil.{RootProject, withState}
@@ -46,7 +47,7 @@ class FileWatchingSpec {
         val signalMsg = "Done compiling."
         val messagesToCheck = List(
           "Compiling 2 Scala sources to" -> 1,
-          "Compiling 1 Scala source to" -> 3
+          "Compiling 1 Scala source to" -> 4
         )
 
         checkFileWatchingIteration(load, RootProject, cmd, signalMsg, messagesToCheck)
@@ -59,12 +60,12 @@ class FileWatchingSpec {
     val load = (logger: Logger) => TestUtil.loadTestProject("with-tests").copy(logger = logger)
     val runTest = Run(Commands.Test(targetProject, watch = true))
     val messagesToCheck = List(
-      "Compiling 1 Scala source to" -> 2,
+      "Compiling 1 Scala source to" -> 3,
       "Compiling 7 Scala sources to" -> 1,
-      "is very personal" -> 2,
-      "+ Greeting.is personal: OK" -> 2,
-      "- should be very personal" -> 2,
-      "Total for specification Specs2Test" -> 2
+      "is very personal" -> 3,
+      "+ Greeting.is personal: OK" -> 3,
+      "- should be very personal" -> 3,
+      "Total for specification Specs2Test" -> 3
     )
 
     val signalMsg = "Test server has been successfully closed."
@@ -72,22 +73,21 @@ class FileWatchingSpec {
   }
 
   /**
-    * Adds non-existing source files and single source files to the project to make sure
-    * that the file watcher handles them correctly. Source files/dirs that don't exist must
-    * be ignored, and single source files that do exist require the watching of its parent.
-    */
-  private def addNonExistingAndSingleFileSources(project: Project): Project = {
+   * Adds non-existing source files and single source files to the project to make sure
+   * that the file watcher handles them correctly. Source files/dirs that don't exist must
+   * be ignored, and single source files that do exist require the watching of its parent.
+   */
+  private def addNonExistingAndSingleFileSourceTo(project: Project): (Project, AbsolutePath) = {
     val currentSources = project.sources
     currentSources.headOption match {
       case Some(source) =>
         val fakeSource = source.getParent.resolve("fake-source-dir-scala")
         val singleFile = project.baseDirectory.resolve("x.scala")
         Files.write(singleFile.underlying, "trait X".getBytes(StandardCharsets.UTF_8))
-        project.copy(sources = currentSources ++ List(fakeSource, singleFile))
-      case None => project
+        project.copy(sources = currentSources ++ List(fakeSource, singleFile)) -> singleFile
+      case None => sys.error(s"Project ${project.name} has no source directories/files!")
     }
   }
-
 
   private def numberDirsOf(project: Project, state: State): Int = {
     val reachable = Dag.dfs(state.build.getDagFor(project))
@@ -112,28 +112,25 @@ class FileWatchingSpec {
     val logger = new PublisherLogger(observer, debug = debug)
 
     // Let's modify the project to add special sources to check the right behaviour of the watcher
-    val state = {
+    val (state, singleFile) = {
       val state0 = load(logger)
-      val project = addNonExistingAndSingleFileSources(
+      val (project, singleFile) = addNonExistingAndSingleFileSourceTo(
         state0.build.getProjectFor(targetProject).get)
       val newProjects =
         state0.build.projects.mapConserve(p => if (p.name == targetProject) project else p)
-      state0.copy(build = state0.build.copy(projects = newProjects))
+      state0.copy(build = state0.build.copy(projects = newProjects)) -> singleFile
     }
 
     val project = state.build.getProjectFor(targetProject).get
     val targetMsg = s"Watching ${numberDirsOf(project, state)}"
-    def areTestsDone(observable: Observable[(String, String)], iteration: Int): Task[Unit] = {
+    def isIterationOver(observable: Observable[(String, String)], iteration: Int): Task[Unit] = {
       observable
-        .existsL { case (level, msg) => msg.contains(signalMsg) }
-        .flatMap { _ =>
-          observable.existsL {
-            case (level, msg) => level == "info" && msg.contains(targetMsg)
-          }
+        .existsL {
+          case (level, msg) => level == "info" && msg.contains(targetMsg)
         }
         .map { success =>
           if (success) ()
-          else sys.error(s"Missing either '$signalMsg' or '$targetMsg' in iteration $iteration")
+          else sys.error(s"Missing '$targetMsg' in iteration $iteration")
         }
     }
 
@@ -145,25 +142,32 @@ class FileWatchingSpec {
     val runTest = TestUtil.interpreterTask(commandToRun, state)
     val testFuture = runTest.runAsync(ExecutionContext.scheduler)
 
-    val checkTests = areTestsDone(observable, 1).flatMap { _ =>
+    val checkTests = isIterationOver(observable, 1).flatMap { _ =>
       // Ugly, but we need to wait a little bit here so that file watching is active
-      Thread.sleep(100)
+      Thread.sleep(200)
 
       // Write the contents of a source back to the same source and force another test execution
+      //Files.write(singleFile.underlying, "object Hello".getBytes("UTF-8"))
       Files.write(newSource.underlying, "object ForceRecompilation {}".getBytes("UTF-8"))
 
-      areTestsDone(observable, 2).map { _ =>
-        testFuture.cancel()
-        val infos = logger.filterMessageByLabel("info")
-        targetMessages.foreach {
-          case (msg, count) =>
-            val times = infos.count(_.contains(msg))
-            assertTrue(s"Predicate '$msg' found $times times, expected $count", times == count)
+      isIterationOver(observable, 2).flatMap { _ =>
+        // Write the contents of a source back to the same source and force another test execution
+        Files.write(singleFile.underlying, "object ForceRecompilation2 {}".getBytes("UTF-8"))
+
+        isIterationOver(observable, 3).map { _ =>
+          testFuture.cancel()
+          val infos = logger.filterMessageByLabel("info")
+          targetMessages.foreach {
+            case (msg, count) =>
+              val times = infos.count(_.contains(msg))
+              assertTrue(s"Predicate '$msg' found $times times, expected $count", times == count)
+          }
         }
       }
     }
 
-    TestUtil.blockOnTask(Task.zip2(Task.fromFuture(testFuture), checkTests), 30)
+    val t = Task.zip2(Task.fromFuture(testFuture), checkTests).doOnCancel(Task(testFuture.cancel()))
+    TestUtil.blockOnTask(t, 20)
     ()
   }
 

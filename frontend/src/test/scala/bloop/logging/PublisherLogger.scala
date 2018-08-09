@@ -13,12 +13,16 @@ final class PublisherLogger(
   override val ansiCodesSupported: Boolean = false
 
   def add(key: String, value: String): Unit = {
-    if (debug) {
-      println(s"[$key] $value")
-    }
+    // Ignore clean screen to show all infos
+    if (value == "\u001b[H\u001b[2J") ()
+    else {
+      if (debug) {
+        println(s"[$key] $value")
+      }
 
-    messages.add((key, value))
-    observer.onNext((key, value))
+      messages.add((key, value))
+      observer.onNext((key, value))
+    }
   }
 
   import scala.collection.JavaConverters._
